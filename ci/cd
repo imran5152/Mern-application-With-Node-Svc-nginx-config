@@ -1,0 +1,138 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/imran5152/Mern-application-With-Node-Svc-nginx-config.git'
+            }
+        }
+
+        stage('Backend Test') {
+            steps {
+                dir('backend') {
+                    sh 'npm install'
+                    sh 'npm test || true'
+                }
+            }
+        }
+
+        stage('Frontend Test') {
+            steps {
+                dir('frontend') {
+                    sh 'npm install'
+                    sh 'npm run build'
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                sh '''
+                    docker run --rm \
+                      -v "${WORKSPACE}:/usr/src" \
+                      sonarsource/sonar-scanner-cli \
+                      -Dsonar.projectKey=three-tioer \
+                      -Dsonar.sources=. \
+                      -Dsonar.host.url=http://98.93.132.92:9000 \
+                      -Dsonar.login=sqp_b45e6ae86048137ab892b3bd5f3ab4ab59ac535f
+                '''
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                parallel(
+                    'Backend Build': {
+                        dir('backend') {
+                            sh 'docker build -t imran5152/ecom-backend-api:latest .'
+                        }
+                    },
+                    'Frontend Build': {
+                        dir('frontend') {
+                            sh 'docker build -t imran5152/ecom-frontend-web:latest .'
+                        }
+                    }
+                )
+            }
+        }
+
+        stage('Trivy Security Scan') {
+            steps {
+                sh '''
+                    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --severity HIGH,CRITICAL imran5152/ecom-backend-api:latest
+                    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --severity HIGH,CRITICAL imran5152/ecom-frontend-web:latest
+                '''
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: '3144f187-758a-4be7-b0ad-376fde95fe6e', passwordVariable: 'DOCKER_PASS', usernameVariable: 'DOCKER_USER')]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push imran5152/ecom-backend-api:latest
+                        docker push imran5152/ecom-frontend-web:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy MongoDB') {
+            steps {
+                dir('k8s') {
+                    sh '''
+                        kubectl apply -f node-config.yml
+                        kubectl apply -f mongodb-service.yml
+                        kubectl apply -f mongodb-statefulset.yml
+                        kubectl rollout status statefulset/mongodb --timeout=120s
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Backend API') {
+            steps {
+                dir('k8s') {
+                    sh '''
+                        kubectl apply -f node-deploy.yml
+                        kubectl apply -f node-svc.yml
+                        kubectl rollout restart deployment/node-deploy
+                        kubectl rollout status deployment/node-deploy --timeout=120s
+                    '''
+                }
+            }
+        }
+
+       stage('Deploy Frontend Web') {
+            steps {
+                dir('k8s') {
+                    sh '''
+                        # 1. React Frontend Deployment aur Service apply karein
+                        kubectl apply -f react-deploy.yml
+                        kubectl apply -f react-svc.yml
+
+                        # 2. Sahi deployment name ke sath rollout restart karein (react-deploy)
+                        kubectl rollout restart deployment/react-deploy
+
+                        # 3. Status verify karein
+                        kubectl rollout status deployment/react-deploy --timeout=120s
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                sh '''
+                    echo "--- Checking Kubernetes Pods & Services ---"
+                    kubectl get pods -o wide
+                    kubectl get svc
+
+                    echo "--- Testing Backend API Data Retrieval ---"
+                    kubectl run temp-curl-test --image=curlimages/curl --rm -i --restart=Never -- curl -s http://node-svc/api/users || true
+                '''
+            }
+        }
+    }
+}
